@@ -1,4 +1,4 @@
-# OpenAI SDK Provider Design
+# OpenAI Rust SDK Provider Design
 
 ## 背景
 
@@ -6,16 +6,18 @@
 
 新的目标是：
 
-- `openai` provider 改为使用 OpenAI 官方 SDK
+- `openai` provider 改为使用成熟 Rust OpenAI SDK
 - 继续沿用当前 `[openai]` 配置结构
 - 继续支持自定义 `base_url`
 - 不破坏后续接入 LM Studio 等本地 OpenAI 风格服务的能力
 
-这里的关键约束不是“能否访问 OpenAI 官方云端”，而是“在官方 SDK 路径下，仍然保留自定义 `base_url` 和 tool calling 映射能力”。
+经确认，当前没有明确可用的 OpenAI 官方 Rust SDK 作为实施基础。因此本次设计改为采用成熟社区 Rust SDK，并优先选择对 OpenAI-compatible provider、`base_url` 与 chat completions 支持更完整的实现。
+
+这里的关键约束不是“是否使用 OpenAI 官方发布的 Rust SDK”，而是“在 Rust SDK 路径下，仍然保留自定义 `base_url` 和 tool calling 映射能力”。
 
 ## 目标
 
-- 用 OpenAI 官方 SDK 替换 `src/llm/openai.rs` 中的手写 HTTP 请求发送逻辑
+- 用成熟 Rust OpenAI SDK 替换 `src/llm/openai.rs` 中的手写 HTTP 请求发送逻辑
 - 保留当前 `provider = "openai"` 与 `[openai]` 的配置接口
 - 保留 `/chat/completions` 语义，而不是切换到不兼容的自定义内部协议
 - 保留现有内部 `ProviderRequest` / `ProviderResponse` / `ProviderContentBlock` 抽象
@@ -31,10 +33,10 @@
 
 ## 推荐方案
 
-采用“官方 SDK 优先 + provider 内部适配层”的方案：
+采用“成熟社区 SDK + provider 内部适配层”的方案：
 
 - `OpenAiProvider` 继续作为项目内部 provider
-- 但 `send()` 不再手写 `reqwest.post(.../chat/completions)`，而是调用官方 SDK
+- 但 `send()` 不再手写 `reqwest.post(.../chat/completions)`，而是调用 Rust SDK
 - `OpenAiProvider` 继续负责把项目内部 `Provider*` 类型映射到 SDK 请求/响应模型
 - `base_url`、`api_key`、`model` 仍由 `[openai]` 配置提供
 
@@ -46,14 +48,14 @@
 
 ## 方案对比
 
-### 方案 A：官方 SDK 完全替换手写 HTTP
+### 方案 A：成熟社区 SDK 完全替换手写 HTTP
 
 - 在 `src/llm/openai.rs` 中完全移除 `reqwest` 请求构造
-- 所有请求和响应都走官方 SDK 类型
+- 所有请求和响应都走 SDK 类型
 
 优点：
 
-- 最符合“采用官方 SDK”的目标
+- 最符合“采用 Rust SDK”的目标
 - 少掉一套自定义 HTTP 序列化/反序列化代码
 
 风险：
@@ -75,7 +77,7 @@
 
 - 语义上是“SDK 为主”，而不是“100% 不含自定义兼容逻辑”
 
-### 方案 C：OpenAI 官方 SDK 与本地兼容服务拆成两个 provider
+### 方案 C：OpenAI SDK 与本地兼容服务拆成两个 provider
 
 - `openai` provider 只服务官方云
 - `lm_studio` 或 `openai_local` 单独实现
@@ -92,7 +94,7 @@
 
 采用方案 B：
 
-- `openai` provider 以官方 SDK 为主实现
+- `openai` provider 以成熟社区 SDK 为主实现
 - 保留 provider 内部适配层
 - 继续支持自定义 `base_url`
 - 继续支持空 `api_key` 的本地兼容场景
@@ -147,7 +149,7 @@ base_url = "http://127.0.0.1:1234/v1"
 
 ### Client 初始化
 
-`from_config()` 应使用官方 SDK 提供的 client/builder 初始化方式，并注入：
+`from_config()` 应使用所选 Rust SDK 提供的 client/builder 初始化方式，并注入：
 
 - `api_key`
 - `base_url`
@@ -209,7 +211,7 @@ SDK 响应需要映射为：
 - 仍从 `[openai].base_url` 读取并传给 SDK
 - provider 内保持对空 `api_key` 的兼容策略
 
-如果官方 SDK 在某些兼容服务上解析更严格，本次不要求“兼容一切私有扩展字段”，只要求兼容当前 provider 已使用的 `/chat/completions` 必需字段。
+如果所选 SDK 在某些兼容服务上解析更严格，本次不要求“兼容一切私有扩展字段”，只要求兼容当前 provider 已使用的 `/chat/completions` 必需字段。
 
 ## 错误处理
 
@@ -237,7 +239,19 @@ SDK 响应需要映射为：
 
 ### 新增
 
-- 增加 OpenAI 官方 Rust SDK 依赖
+- 增加成熟 Rust OpenAI SDK 依赖
+- 推荐优先评估 `async-openai`，因为其公开说明已包含 OpenAI-compatible provider、自定义 `OPENAI_BASE_URL` 和 Chat Completions 支持
+
+### SDK 选型结论
+
+本次优先使用 `async-openai`，原因是：
+
+- 明确支持 Chat Completions
+- 明确支持 OpenAI-compatible providers
+- 已公开支持自定义 `OPENAI_BASE_URL`
+- builder 和类型系统相对成熟，适合作为当前 provider 的替换底座
+
+这并不意味着项目整体绑定 `async-openai` 的公开类型；它仍只应出现在 `src/llm/openai.rs` 内部。
 
 ### 保留或移除
 
@@ -268,7 +282,7 @@ SDK 响应需要映射为：
 
 ## 实施顺序
 
-1. 在 `Cargo.toml` 引入 OpenAI 官方 SDK
+1. 在 `Cargo.toml` 引入 Rust OpenAI SDK
 2. 重写 `src/llm/openai.rs` 的 client 初始化逻辑
 3. 将 chat completions 请求改为使用 SDK 请求类型
 4. 将响应解析改为使用 SDK 响应类型
@@ -277,7 +291,7 @@ SDK 响应需要映射为：
 
 ## 验收标准
 
-- `openai` provider 使用 OpenAI 官方 SDK 实现请求发送
+- `openai` provider 使用成熟 Rust OpenAI SDK 实现请求发送
 - 当前 `[openai]` 配置结构保持不变
 - `base_url` 仍可配置
 - 空 `api_key` 场景仍可用于本地兼容服务
