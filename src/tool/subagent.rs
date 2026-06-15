@@ -1,11 +1,11 @@
-use anthropic_ai_sdk::types::message::{Message, Role};
 use anyhow::Result;
-use tool_macros::tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tool_macros::tool;
 
 use crate::{
-    Agent, AgentSystemPrompt, extract_text, get_llm_client,
+    Agent, AgentSystemPrompt, extract_text,
+    llm::{ProviderMessage, ProviderRole, build_provider},
     mcp::MCPToolRouter,
     permission::{PermissionManager, PermissionMode},
     tool::{ToolContext, subagent_toolset},
@@ -30,13 +30,15 @@ pub async fn task(ctx: ToolContext, input: SubagentInput) -> Result<String> {
         input.prompt
     );
 
-    let client = get_llm_client()?;
+    let config = ctx.config.clone();
+    let provider = build_provider(config.clone())?;
     let system_prompt = format!(
         "You are a coding subagent at {}. Complete the given task, then summarize your findings.",
         ctx.work_dir.display()
     );
     let mut subagent = Agent::new(
-        client,
+        config,
+        provider,
         ctx,
         subagent_toolset(),
         MCPToolRouter::new(),
@@ -46,7 +48,7 @@ pub async fn task(ctx: ToolContext, input: SubagentInput) -> Result<String> {
     subagent
         .runtime
         .context
-        .push(Message::new_text(Role::User, input.prompt));
+        .push(ProviderMessage::new_text(ProviderRole::User, input.prompt));
     subagent.agent_loop().await?;
 
     let summary = subagent
@@ -54,7 +56,7 @@ pub async fn task(ctx: ToolContext, input: SubagentInput) -> Result<String> {
         .context
         .iter()
         .rev()
-        .find(|message| matches!(message.role, Role::Assistant))
+        .find(|message| matches!(message.role, ProviderRole::Assistant))
         .map(|message| extract_text(&message.content))
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "(no summary)".to_string());

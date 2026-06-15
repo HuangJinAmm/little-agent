@@ -1,4 +1,3 @@
-use anthropic_ai_sdk::types::message::{ContentBlock, Message, MessageContent, Role};
 use anyhow::Context as _;
 use std::{
     fs::{self, File},
@@ -6,6 +5,8 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::llm::{ProviderContentBlock, ProviderMessage, ProviderRole};
 
 const KEEP_RECENT_TOOL_RESULTS: usize = 3;
 const PERSIST_THRESHOLD: usize = 30_000;
@@ -22,7 +23,7 @@ pub struct CompactState {
     pub recent_files: Vec<String>,
 }
 
-pub fn micro_compact(messages: &mut [Message]) {
+pub fn micro_compact(messages: &mut [ProviderMessage]) {
     let tool_result_positions = collect_tool_result_positions(messages);
     if tool_result_positions.len() <= KEEP_RECENT_TOOL_RESULTS {
         return;
@@ -33,13 +34,10 @@ pub fn micro_compact(messages: &mut [Message]) {
         let Some(message) = messages.get_mut(message_idx) else {
             continue;
         };
-        let MessageContent::Blocks { content } = &mut message.content else {
-            continue;
-        };
-        let Some(ContentBlock::ToolResult {
+        let Some(ProviderContentBlock::ToolResult {
             content: tool_content,
             ..
-        }) = content.get_mut(block_idx)
+        }) = message.content.get_mut(block_idx)
         else {
             continue;
         };
@@ -50,13 +48,13 @@ pub fn micro_compact(messages: &mut [Message]) {
     }
 }
 
-pub fn estimate_context_size(messages: &[Message]) -> usize {
+pub fn estimate_context_size(messages: &[ProviderMessage]) -> usize {
     serde_json::to_string(messages)
         .map(|serialized| serialized.chars().count())
         .unwrap_or_default()
 }
 
-pub fn write_transcript(messages: &[Message]) -> anyhow::Result<PathBuf> {
+pub fn write_transcript(messages: &[ProviderMessage]) -> anyhow::Result<PathBuf> {
     let transcript_dir = std::env::current_dir()?.join(TRANSCRIPT_DIR);
     fs::create_dir_all(&transcript_dir)
         .with_context(|| format!("failed to create {}", transcript_dir.display()))?;
@@ -103,24 +101,21 @@ pub fn persist_large_output(tool_use_id: &str, output: &str) -> anyhow::Result<S
     ))
 }
 
-pub fn compacted_context(summary: String) -> Vec<Message> {
-    vec![Message::new_text(
-        Role::User,
+pub fn compacted_context(summary: String) -> Vec<ProviderMessage> {
+    vec![ProviderMessage::new_text(
+        ProviderRole::User,
         format!("This conversation was compacted so the agent can continue working.\n\n{summary}"),
     )]
 }
 
-fn collect_tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
+fn collect_tool_result_positions(messages: &[ProviderMessage]) -> Vec<(usize, usize)> {
     let mut positions = Vec::new();
     for (message_idx, message) in messages.iter().enumerate() {
-        if !matches!(message.role, Role::User) {
+        if !matches!(message.role, ProviderRole::User) {
             continue;
         }
-        let MessageContent::Blocks { content } = &message.content else {
-            continue;
-        };
-        for (block_idx, block) in content.iter().enumerate() {
-            if matches!(block, ContentBlock::ToolResult { .. }) {
+        for (block_idx, block) in message.content.iter().enumerate() {
+            if matches!(block, ProviderContentBlock::ToolResult { .. }) {
                 positions.push((message_idx, block_idx));
             }
         }

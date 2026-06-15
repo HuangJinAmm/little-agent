@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use crate::tool::ToolContext;
 use anyhow::Result;
-use tool_macros::tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{process::Command, time::timeout};
+use tool_macros::tool;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BashInput {

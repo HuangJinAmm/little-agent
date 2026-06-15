@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::ToolSpec;
 use crate::background::SharedBackgroundManager;
+use crate::config::AgentConfig;
 use crate::cron::SharedCronScheduler;
 use crate::memory::MemoryManager;
 use crate::skill::SkillRegistry;
@@ -51,6 +52,7 @@ use write_file::WriteFileTool;
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub config: Arc<AgentConfig>,
     pub skill_registry: Arc<SkillRegistry>,
     pub memory_manager: Arc<std::sync::Mutex<MemoryManager>>,
     pub work_dir: PathBuf,
@@ -297,6 +299,19 @@ mod tests {
         let store_root = StoreRoot::new(root_dir.join(".claude")).unwrap();
 
         ToolContext {
+            config: Arc::new(AgentConfig {
+                provider: crate::config::ProviderKind::Anthropic,
+                anthropic: Some(crate::config::AnthropicConfig {
+                    model: "claude-sonnet-4-5".to_string(),
+                    api_key: "test-key".to_string(),
+                    base_url: "https://example.com".to_string(),
+                }),
+                openai: None,
+                runtime: crate::config::RuntimeConfig {
+                    context_limit: 50_000,
+                    max_tokens: 8_000,
+                },
+            }),
             skill_registry: Arc::new(SkillRegistry::new(root_dir.join("skills"))),
             memory_manager: Arc::new(std::sync::Mutex::new(MemoryManager::new(
                 root_dir.join(".claude/memory"),

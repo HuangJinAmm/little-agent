@@ -1,7 +1,10 @@
+pub mod attachment;
 pub mod background;
 pub mod compact;
+pub mod config;
 pub mod cron;
 pub mod hook;
+pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod permission;
@@ -16,23 +19,22 @@ pub mod worktree;
 
 pub use anthropic_ai_sdk::types::message::Tool as ToolSpec;
 
-use anthropic_ai_sdk::{
-    client::{AnthropicClient, AnthropicClientBuilder},
-    types::message::{
-        ContentBlock, CreateMessageParams, Message, MessageClient, MessageContent, MessageError,
-        RequiredMessageParams, Role, StopReason,
-    },
-};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::path::Path;
+use std::{io::Write, path::Path, sync::Arc};
 
 use crate::compact::{
     CompactState, compacted_context, estimate_context_size, micro_compact, persist_large_output,
     write_transcript,
 };
+use crate::config::AgentConfig;
 use crate::hook::{
     Hook, HookControl, HookTypes, PostToolUseFn, PreToolUseFn, SessionStartFn, ToolResult, ToolUse,
+};
+use crate::llm::{
+    LlmProvider, ProviderContentBlock, ProviderMessage, ProviderRequest, ProviderResponse,
+    ProviderRole,
+    ProviderStopReason, ProviderToolSpec, extract_text_from_blocks,
 };
 use crate::mcp::MCPToolRouter;
 use crate::memory::MEMORY_GUIDANCE;
@@ -44,29 +46,14 @@ use crate::recovery::{
 };
 use crate::tool::{ToolContext, ToolRouter};
 
-pub fn get_model() -> anyhow::Result<String> {
-    dotenvy::dotenv().ok();
-    std::env::var("ANTHROPIC_MODEL").context("ANTHROPIC_MODEL is not set")
-}
-const CONTEXT_LIMIT: usize = 50_000;
-
-pub fn get_llm_client() -> anyhow::Result<AnthropicClient> {
-    dotenvy::dotenv().ok();
-
-    let anthropic_api_key =
-        std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
-    let anthropic_base_url =
-        std::env::var("ANTHROPIC_BASE_URL").context("ANTHROPIC_BASE_URL is not set")?;
-    let client = AnthropicClientBuilder::new(anthropic_api_key, "")
-        .with_api_base_url(anthropic_base_url)
-        .build::<MessageError>()
-        .context("can't create client")?;
-    Ok(client)
+pub fn get_model(config: &AgentConfig) -> String {
+    config.active_model().to_string()
 }
 
 pub struct AgentRuntime {
-    pub client: AnthropicClient,
-    pub context: Vec<Message>,
+    pub config: Arc<AgentConfig>,
+    pub provider: Arc<dyn LlmProvider>,
+    pub context: Vec<ProviderMessage>,
     pub compact_state: CompactState,
     pub recovery_state: RecoveryState,
     pub permission_manager: PermissionManager,
@@ -88,7 +75,8 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(
-        client: AnthropicClient,
+        config: Arc<AgentConfig>,
+        provider: Arc<dyn LlmProvider>,
         tool_context: ToolContext,
         tools: ToolRouter,
         mcp_router: MCPToolRouter,
@@ -97,7 +85,8 @@ impl Agent {
     ) -> Self {
         Self {
             runtime: AgentRuntime {
-                client,
+                config,
+                provider,
                 context: Vec::new(),
                 compact_state: CompactState::default(),
                 recovery_state: RecoveryState::default(),
@@ -112,24 +101,26 @@ impl Agent {
     }
 
     pub async fn agent_loop(&mut self) -> Result<()> {
+        self.agent_loop_with_streaming(false).await
+    }
+
+    pub async fn agent_loop_streaming(&mut self) -> Result<()> {
+        self.agent_loop_with_streaming(true).await
+    }
+
+    async fn agent_loop_with_streaming(&mut self, stream_text: bool) -> Result<()> {
         self.runtime.recovery_state = RecoveryState::default();
         let system = self.build_system_prompt()?;
         loop {
             micro_compact(&mut self.runtime.context);
-            if estimate_context_size(&self.runtime.context) > CONTEXT_LIMIT {
+            if estimate_context_size(&self.runtime.context)
+                > self.runtime.config.runtime.context_limit
+            {
                 println!("[auto compact]");
                 self.compact_history(None).await?;
             }
 
-            let request = CreateMessageParams::new(RequiredMessageParams {
-                model: get_model()?,
-                messages: self.runtime.context.clone(),
-                max_tokens: 8000,
-            })
-            .with_system(&system)
-            .with_tools(self.all_tool_specs());
-
-            let response = match self.runtime.client.create_message(Some(&request)).await {
+            let response = match self.request_once(&system, stream_text).await {
                 Ok(response) => {
                     self.runtime.recovery_state.transport_attempts = 0;
                     response
@@ -167,12 +158,12 @@ impl Agent {
                 }
             };
 
-            self.runtime.context.push(Message::new_blocks(
-                Role::Assistant,
+            self.runtime.context.push(ProviderMessage::new_blocks(
+                ProviderRole::Assistant,
                 response.content.clone(),
             ));
 
-            if matches!(response.stop_reason, Some(StopReason::MaxTokens))
+            if matches!(response.stop_reason, Some(ProviderStopReason::MaxTokens))
                 && self.runtime.recovery_state.continuation_attempts < MAX_RECOVERY_ATTEMPTS
             {
                 self.runtime.recovery_state.continuation_attempts += 1;
@@ -180,15 +171,16 @@ impl Agent {
                     "[Recovery] continue ({}/{}): output truncated",
                     self.runtime.recovery_state.continuation_attempts, MAX_RECOVERY_ATTEMPTS
                 );
-                self.runtime
-                    .context
-                    .push(Message::new_text(Role::User, CONTINUATION_MESSAGE));
+                self.runtime.context.push(ProviderMessage::new_text(
+                    ProviderRole::User,
+                    CONTINUATION_MESSAGE,
+                ));
                 continue;
             }
             self.runtime.recovery_state.continuation_attempts = 0;
 
             if let Some(stop_reason) = response.stop_reason
-                && !matches!(stop_reason, StopReason::ToolUse)
+                && !matches!(stop_reason, ProviderStopReason::ToolUse)
             {
                 return Ok(());
             }
@@ -197,7 +189,7 @@ impl Agent {
 
             self.runtime
                 .context
-                .push(Message::new_blocks(Role::User, tool_result));
+                .push(ProviderMessage::new_blocks(ProviderRole::User, tool_result));
 
             if let Some(focus) = manual_compact {
                 println!("[manual compact]");
@@ -206,14 +198,52 @@ impl Agent {
         }
     }
 
+    async fn request_once(
+        &mut self,
+        system: &str,
+        stream_text: bool,
+    ) -> Result<ProviderResponse> {
+        let request = ProviderRequest {
+            model: get_model(self.runtime.config.as_ref()),
+            system: Some(system.to_string()),
+            messages: self.runtime.context.clone(),
+            tools: self.all_tool_specs(),
+            max_tokens: self.runtime.config.runtime.max_tokens,
+        };
+
+        if !stream_text {
+            return self.runtime.provider.send(request).await;
+        }
+
+        let mut printed_any = false;
+        let response = self
+            .runtime
+            .provider
+            .send_streaming(request, &mut |delta| {
+                if delta.is_empty() {
+                    return;
+                }
+                printed_any = true;
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+            })
+            .await;
+
+        if printed_any {
+            println!();
+        }
+
+        response
+    }
+
     pub async fn execute_tool_call(
         &mut self,
-        content: &[ContentBlock],
-    ) -> Result<(Vec<ContentBlock>, Option<String>)> {
+        content: &[ProviderContentBlock],
+    ) -> Result<(Vec<ProviderContentBlock>, Option<String>)> {
         let mut result = Vec::new();
         let mut manual_compact = None;
         for block in content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
+            if let ProviderContentBlock::ToolUse { id, name, input } = block {
                 let mut tool_use = ToolUse {
                     id: id.clone(),
                     name: name.clone(),
@@ -229,7 +259,7 @@ impl Agent {
                             PermissionBehavior::Allow => {}
                             PermissionBehavior::Deny => {
                                 return Ok((
-                                    vec![ContentBlock::ToolResult {
+                                    vec![ProviderContentBlock::ToolResult {
                                         tool_use_id: id.clone(),
                                         content: format!("Permission denied: {}", decision.reason),
                                     }],
@@ -243,7 +273,7 @@ impl Agent {
                                     .ask_user(&tool_use.name, &tool_use.input)?
                                 {
                                     return Ok((
-                                        vec![ContentBlock::ToolResult {
+                                        vec![ProviderContentBlock::ToolResult {
                                             tool_use_id: id.clone(),
                                             content: format!(
                                                 "Permission denied by user for {}",
@@ -274,7 +304,7 @@ impl Agent {
                     }
                     Err(error) => format!("PreToolUse hook failed: {error}"),
                 };
-                result.push(ContentBlock::ToolResult {
+                result.push(ProviderContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: output,
                 });
@@ -315,11 +345,12 @@ impl Agent {
             .collect()
     }
 
-    pub fn all_tool_specs(&self) -> Vec<ToolSpec> {
+    pub fn all_tool_specs(&self) -> Vec<ProviderToolSpec> {
         self.tools
             .tool_specs()
             .into_iter()
             .chain(self.mcp_router.all_tools())
+            .map(Into::into)
             .collect()
     }
 
@@ -409,21 +440,15 @@ Be compact but concrete.\n\n\
             prompt.push_str(&format!("\n\nRecent files to reopen if needed:\n{recent}"));
         }
 
-        let request = CreateMessageParams::new(RequiredMessageParams {
-            model: get_model()?,
-            messages: vec![Message::new_text(Role::User, prompt)],
-            max_tokens: 2000,
-        });
-        let response = self.runtime.client.create_message(Some(&request)).await?;
-        let summary = response
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let request = ProviderRequest {
+            model: get_model(self.runtime.config.as_ref()),
+            system: None,
+            messages: vec![ProviderMessage::new_text(ProviderRole::User, prompt)],
+            tools: Vec::new(),
+            max_tokens: self.runtime.config.runtime.max_tokens,
+        };
+        let response = self.runtime.provider.send(request).await?;
+        let summary = extract_text_from_blocks(&response.content);
 
         self.runtime.compact_state.has_compacted = true;
         self.runtime.compact_state.last_summary = Some(summary.clone());
@@ -471,7 +496,7 @@ Be compact but concrete.\n\n\
             .skills_available(self.tool_context.skill_registry.describe_available())
             .memory(self.load_memory_prompt()?)
             .claude_md(load_claude_md_prompt(workdir))
-            .dynamic_context(load_dynamic_context(workdir))
+            .dynamic_context(load_dynamic_context(workdir, self.runtime.config.as_ref()))
             .memory_guidance(MEMORY_GUIDANCE.trim())
             .build()?;
 
@@ -492,32 +517,16 @@ Be compact but concrete.\n\n\
 
 pub type LoopState = Agent;
 
-pub fn extract_text(content: &MessageContent) -> String {
-    match content {
-        MessageContent::Text { content } => content.clone(),
-        MessageContent::Blocks { content } => content
-            .iter()
-            .filter_map(|block| {
-                if let ContentBlock::Text { text } = block {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+pub fn extract_text(content: &[ProviderContentBlock]) -> String {
+    extract_text_from_blocks(content)
 }
 
-fn load_dynamic_context(workdir: &Path) -> String {
+fn load_dynamic_context(workdir: &Path, config: &AgentConfig) -> String {
     let lines = [
         "# Dynamic context".to_string(),
         format!("Current date: {}", Utc::now().date_naive()),
         format!("Working directory: {}", workdir.display()),
-        format!(
-            "Model: {}",
-            get_model().unwrap_or_else(|_| "unknown".to_string())
-        ),
+        format!("Model: {}", get_model(config)),
         format!("Platform: {}", std::env::consts::OS),
     ];
     lines.join("\n")

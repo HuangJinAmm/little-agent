@@ -1,14 +1,15 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-use anthropic_ai_sdk::types::message::{Message, Role::User};
 use anyhow::Context;
 use inquire::{Select, Text};
 
 use little_agent::{
     Agent, AgentSystemPrompt,
+    attachment::{build_user_message, load_attachment_blocks, parse_attachment_input},
     background::SharedBackgroundManager,
+    config::AgentConfig,
     cron::{CronScheduler, SharedCronScheduler},
-    extract_text, get_llm_client,
+    llm::build_provider,
     mcp::load_mcp_router,
     memory::get_memory_manager,
     permission::{PermissionManager, PermissionMode},
@@ -21,10 +22,14 @@ use little_agent::{
 };
 
 const SKILLS_DIR: &str = "skills";
+const AGENT_CONFIG_PATH: &str = ".claude/agent.toml";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = get_llm_client()?;
+    let work_dir = std::env::current_dir()?;
+    let config_path = work_dir.join(AGENT_CONFIG_PATH);
+    let config = Arc::new(AgentConfig::load(&config_path)?);
+    let provider = build_provider(config.clone())?;
 
     let mode = Select::new(
         "Permission mode:",
@@ -39,9 +44,8 @@ async fn main() -> anyhow::Result<()> {
     let permission_manager = PermissionManager::try_new(mode)?;
     println!("[Permission mode: {}]", permission_manager.mode());
 
-    let skills_dir = std::env::current_dir()?.join(SKILLS_DIR);
+    let skills_dir = work_dir.join(SKILLS_DIR);
     let skill_registry = Arc::new(get_skill_registry(skills_dir)?);
-    let work_dir = std::env::current_dir()?;
     let store_root = StoreRoot::new(work_dir.join(".claude"))?;
     let task_manager = SharedTaskManager::new(TaskManager::new(&store_root)?);
     let background_manager = SharedBackgroundManager::new(&store_root)?;
@@ -56,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     let tools = toolset();
     let tool_context = ToolContext {
+        config: config.clone(),
         skill_registry: skill_registry.clone(),
         memory_manager,
         work_dir,
@@ -67,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut agent = Agent::new(
-        client.clone(),
+        config,
+        provider,
         tool_context,
         tools,
         mcp_router,
@@ -84,17 +90,21 @@ async fn main() -> anyhow::Result<()> {
         if query.trim() == "exit()" {
             break;
         }
-        agent.runtime.context.push(Message::new_text(User, query));
+        let attachment_input =
+            Text::new("--- Optional attachments (semicolon-separated paths, leave blank for none)")
+                .prompt()
+                .context("An error happened or user cancelled the input.")?;
+        let attachment_paths = parse_attachment_input(&attachment_input)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let attachments = load_attachment_blocks(&attachment_paths)?;
+        agent
+            .runtime
+            .context
+            .push(build_user_message(query, attachments));
 
-        agent.agent_loop().await?;
-
-        let Some(final_content) = agent.runtime.context.last() else {
-            continue;
-        };
-        println!(
-            "--- Final response:\n{}",
-            extract_text(&final_content.content)
-        );
+        agent.agent_loop_streaming().await?;
     }
 
     Ok(())
