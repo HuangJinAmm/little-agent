@@ -3,3 +3,4 @@ ai_agent/target/
 # Added by cargo
 
 /target
+/docs/

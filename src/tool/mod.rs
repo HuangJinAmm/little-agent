@@ -18,6 +18,7 @@ use serde_json::Value;
 
 mod background;
 mod bash;
+mod cmd;
 mod compact;
 mod cron;
 mod edit_file;
@@ -32,6 +33,7 @@ mod worktree;
 mod write_file;
 use background::{BackgroundRunTool, CheckBackgroundTool};
 use bash::BashTool;
+use cmd::CmdTool;
 use compact::CompactTool;
 use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 use edit_file::EditFileTool;
@@ -63,47 +65,57 @@ pub struct ToolContext {
     pub worktree_manager: SharedWorktreeManager,
 }
 
+fn route_platform_shell(router: ToolRouter) -> ToolRouter {
+    if cfg!(target_os = "windows") {
+        router.route(CmdTool)
+    } else {
+        router.route(BashTool)
+    }
+}
+
 pub fn toolset() -> ToolRouter {
-    ToolRouter::new()
-        .route(AddTool)
-        .route(BashTool)
-        .route(BackgroundRunTool)
-        .route(CheckBackgroundTool)
-        .route(CronCreateTool)
-        .route(CronDeleteTool)
-        .route(CronListTool)
-        .route(ReadFileTool)
-        .route(WriteFileTool)
-        .route(EditFileTool)
-        .route(LoadSkillTool)
-        .route(SaveMemoryTool)
-        .route(CompactTool)
-        .route(TaskTool)
-        .route(TaskCreateTool)
-        .route(TaskGetTool)
-        .route(TaskListTool)
-        .route(TaskUpdateTool)
-        .route(SpawnTeammateTool)
-        .route(ListTeammatesTool)
-        .route(SendMessageTool)
-        .route(BroadcastTool)
-        .route(ReadInboxTool)
-        .route(PlanApprovalTool)
-        .route(ShutdownRequestTool)
-        .route(ShutdownResponseTool)
-        .route(WorktreeCreateTool)
-        .route(WorktreeListTool)
-        .route(WorktreeStatusTool)
-        .route(WorktreeRunTool)
-        .route(WorktreeEventsTool)
+    route_platform_shell(
+        ToolRouter::new()
+            .route(AddTool)
+            .route(BackgroundRunTool)
+            .route(CheckBackgroundTool)
+            .route(CronCreateTool)
+            .route(CronDeleteTool)
+            .route(CronListTool)
+            .route(ReadFileTool)
+            .route(WriteFileTool)
+            .route(EditFileTool)
+            .route(LoadSkillTool)
+            .route(SaveMemoryTool)
+            .route(CompactTool)
+            .route(TaskTool)
+            .route(TaskCreateTool)
+            .route(TaskGetTool)
+            .route(TaskListTool)
+            .route(TaskUpdateTool)
+            .route(SpawnTeammateTool)
+            .route(ListTeammatesTool)
+            .route(SendMessageTool)
+            .route(BroadcastTool)
+            .route(ReadInboxTool)
+            .route(PlanApprovalTool)
+            .route(ShutdownRequestTool)
+            .route(ShutdownResponseTool)
+            .route(WorktreeCreateTool)
+            .route(WorktreeListTool)
+            .route(WorktreeStatusTool)
+            .route(WorktreeRunTool)
+            .route(WorktreeEventsTool),
+    )
 }
 
 pub fn subagent_toolset() -> ToolRouter {
-    ToolRouter::new()
-        .route(BashTool)
-        .route(ReadFileTool)
-        .route(WriteFileTool)
-        .route(EditFileTool)
+    route_platform_shell(
+        ToolRouter::new()
+            .route(ReadFileTool)
+            .route(WriteFileTool)
+            .route(EditFileTool),
+    )
 }
 
 #[async_trait]
@@ -292,7 +304,39 @@ mod tests {
         assert_eq!(schema["properties"]["b"]["type"], "integer");
     }
 
-    fn test_context(name: &str) -> ToolContext {
+    fn assert_platform_shell_tool(names: &[String]) {
+        if cfg!(target_os = "windows") {
+            assert!(names.iter().any(|name| name == "cmd"));
+            assert!(!names.iter().any(|name| name == "bash"));
+        } else {
+            assert!(names.iter().any(|name| name == "bash"));
+            assert!(!names.iter().any(|name| name == "cmd"));
+        }
+    }
+
+    #[test]
+    fn platform_shell_tool_is_registered_for_main_toolset() {
+        let names = toolset()
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_platform_shell_tool(&names);
+    }
+
+    #[test]
+    fn platform_shell_tool_is_registered_for_subagent_toolset() {
+        let names = subagent_toolset()
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_platform_shell_tool(&names);
+    }
+
+    pub(crate) fn test_context(name: &str) -> ToolContext {
         let root_dir = std::env::temp_dir().join(format!("sfull-tool-test-{name}"));
         let _ = std::fs::remove_dir_all(&root_dir);
         std::fs::create_dir_all(&root_dir).unwrap();

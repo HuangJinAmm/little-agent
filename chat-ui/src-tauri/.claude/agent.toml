@@ -1,0 +1,19 @@
+
+
+
+provider = "openai"
+
+[anthropic]
+model = "gemma-4-12b-qat"
+api_key = "sk-lm-BBGfEb5G:6uKyo1YuHegpqK7A2vmM"
+base_url = "http://127.0.0.1:1234/v1"
+
+[openai]
+model = "gemma-4-12b-qat"
+api_key = "sk-lm-BBGfEb5G:6uKyo1YuHegpqK7A2vmM"
+base_url = "http://127.0.0.1:1234/v1"
+
+
+[runtime]
+context_limit = 50000
+max_tokens = 8000

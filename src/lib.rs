@@ -71,6 +71,8 @@ pub struct Agent {
     pub mcp_router: MCPToolRouter,
     pub hooks: Vec<Hook>,
     pub system_prompt: AgentSystemPrompt,
+    pub stream_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub status_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl Agent {
@@ -97,7 +99,17 @@ impl Agent {
             mcp_router,
             hooks: Vec::new(),
             system_prompt,
+            stream_handler: None,
+            status_handler: None,
         }
+    }
+
+    pub fn set_stream_handler(&mut self, handler: impl Fn(String) + Send + Sync + 'static) {
+        self.stream_handler = Some(Arc::new(handler));
+    }
+
+    pub fn set_status_handler(&mut self, handler: impl Fn(String) + Send + Sync + 'static) {
+        self.status_handler = Some(Arc::new(handler));
     }
 
     pub async fn agent_loop(&mut self) -> Result<()> {
@@ -216,6 +228,7 @@ impl Agent {
         }
 
         let mut printed_any = false;
+        let handler = self.stream_handler.clone();
         let response = self
             .runtime
             .provider
@@ -224,8 +237,12 @@ impl Agent {
                     return;
                 }
                 printed_any = true;
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
+                if let Some(h) = &handler {
+                    h(delta.to_string());
+                } else {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                }
             })
             .await;
 
@@ -285,12 +302,18 @@ impl Agent {
                                 }
                             }
                         }
+                        if let Some(h) = &self.status_handler {
+                            h(format!("Executing tool: {}", tool_use.name));
+                        }
                         let mut result = ToolResult {
                             tool_use_id: tool_use.id.clone(),
                             content: self
                                 .execute(&tool_use.id, &tool_use.name, &tool_use.input)
                                 .await,
                         };
+                        if let Some(h) = &self.status_handler {
+                            h(format!("Finished tool: {}", tool_use.name));
+                        }
                         match invoke_hooks!(PostToolUse, self, &tool_use, &mut result) {
                             Ok(HookControl::Continue) => result.content,
                             Ok(HookControl::Block(reason)) => {
