@@ -3,4 +3,7 @@ ai_agent/target/
 # Added by cargo
 
 /target
+<<<<<<< HEAD
 /docs/
+=======
+>>>>>>> 0c5659a893e311f5ea5433d9c152743b5f648219
