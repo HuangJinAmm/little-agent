@@ -1,13 +1,7 @@
 use anyhow::{Context as _, Result};
-<<<<<<< HEAD
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tool_macros::tool;
-=======
-use tool_macros::tool;
-use schemars::JsonSchema;
-use serde::Deserialize;
->>>>>>> 0c5659a893e311f5ea5433d9c152743b5f648219
 
 use crate::{memory::MemoryType, tool::ToolContext};
 
